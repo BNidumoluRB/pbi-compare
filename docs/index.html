@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PBI Prod vs Test Compare</title>
+<style>
+  :root { --fg:#202124; --muted:#5f6368; --line:#dadce0; --accent:#1a73e8; --bg:#ffffff; --bar:#f8f9fa; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8eaed; --muted:#9aa0a6; --line:#3c4043; --accent:#8ab4f8; --bg:#202124; --bar:#292a2d; }
+  }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+               font-family: Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:8px 16px; background:var(--bar);
+           border-bottom:1px solid var(--line); font-size:14px; flex-wrap:wrap; }
+  header b { font-size:15px; }
+  header .sp { flex:1; }
+  header a { color:var(--accent); text-decoration:none; font-weight:600; }
+  #frame { border:0; width:100%; height:calc(100% - 42px); display:block; }
+  #fallback { display:none; max-width:640px; margin:60px auto; padding:0 16px; line-height:1.55; }
+  #fallback a.btn { display:inline-block; background:var(--accent); color:#fff; padding:10px 20px;
+                    border-radius:8px; text-decoration:none; font-weight:600; margin-top:8px; }
+  @media (max-width: 640px) { #frame { height:calc(100% - 64px); } }
+</style>
+</head>
+<body>
+<header>
+  <b>📊 Power BI Prod ↔ Test comparison</b>
+  <span class="sp"></span>
+  <a id="newtab" target="_blank" rel="noopener">Open in a new tab ↗</a>
+</header>
+<iframe id="frame" title="Power BI Prod vs Test comparison app"
+        allow="clipboard-write" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+<div id="fallback">
+  <h2>The app opens in its own tab</h2>
+  <p>Your browser blocked showing the app inside this page (common when the app requires
+     sign-in). Open it directly instead:</p>
+  <a class="btn" id="fallback-link" target="_blank" rel="noopener">Open the comparison app</a>
+</div>
+<script>
+  // ---- Set this to your Streamlit Community Cloud URL after deploying -----------------
+  const APP_URL = "https://YOUR-APP-NAME.streamlit.app";
+  // ------------------------------------------------------------------------------------
+  const url = new URL(APP_URL);
+  document.getElementById("newtab").href = url.href;
+  document.getElementById("fallback-link").href = url.href;
+  const embed = new URL(url.href);
+  embed.searchParams.set("embed", "true");
+  embed.searchParams.set("embed_options", "show_toolbar");
+  const frame = document.getElementById("frame");
+  if (APP_URL.includes("YOUR-APP-NAME")) {
+    frame.style.display = "none";
+    const fb = document.getElementById("fallback");
+    fb.style.display = "block";
+    fb.querySelector("h2").textContent = "App URL not configured yet";
+    fb.querySelector("p").textContent = "Edit docs/index.html and set APP_URL to the Streamlit app's address.";
+  } else {
+    frame.src = embed.href;
+    // if the app can't be framed (e.g. private app sign-in), show the direct link after a while
+    let loaded = false;
+    frame.addEventListener("load", () => { loaded = true; });
+    setTimeout(() => {
+      if (!loaded) {
+        frame.style.display = "none";
+        document.getElementById("fallback").style.display = "block";
+      }
+    }, 20000);
+  }
+</script>
+</body>
+</html>

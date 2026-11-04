@@ -1,0 +1,10 @@
+[server]
+maxMessageSize = 400
+maxUploadSize = 200
+
+[theme]
+primaryColor = "#1A73E8"
+base = "light"
+
+[browser]
+gatherUsageStats = false
