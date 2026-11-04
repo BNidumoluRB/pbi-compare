@@ -6,23 +6,47 @@ Deploy:        Streamlit Community Cloud -> this repo -> app.py (see README.md)
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from pbi_compare import __version__
-from pbi_compare.auth import AuthError, TokenProvider
-from pbi_compare.compare import (STATUS_COLORS, STATUS_DIFF, STATUS_ERROR, STATUS_HIDDEN,
+# Make the bundled package importable however the app is launched.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+_PKG = os.path.join(_HERE, "pbi_compare")
+_NEEDED = ["__init__.py", "auth.py", "compare.py", "config.py", "dax_builder.py", "demo.py",
+           "model.py", "pbi_api.py", "report_builder.py", "report_parser.py", "runner.py",
+           "samples.py", "screenshots.py", "snowflake_runner.py", "sql_builder.py"]
+_missing = [f for f in _NEEDED if not os.path.isfile(os.path.join(_PKG, f))]
+if _missing:
+    st.error("The app's code folder **pbi_compare/** is missing from the repository"
+             + (" or incomplete" if len(_missing) < len(_NEEDED) else "") + ".")
+    st.markdown(
+        "It must sit next to `app.py` in the repo, with these files inside it:\n\n"
+        + "\n".join(f"- `pbi_compare/{f}`" + (" ❌ missing" if f in _missing else " ✅")
+                    for f in _NEEDED)
+        + "\n\nUpload the whole folder (see the README, *Upload the code*), then reboot the app.")
+    st.caption("Files found next to app.py: " + ", ".join(sorted(os.listdir(_HERE))))
+    st.stop()
+
+from pbi_compare import __version__  # noqa: E402
+from pbi_compare.auth import AuthError, SsoTokenProvider, TokenProvider, UserTokenProvider  # noqa: E402
+from pbi_compare.compare import (STATUS_COLORS, STATUS_DIFF, STATUS_ERROR, STATUS_HIDDEN,  # noqa: E402
                                  STATUS_MATCH, diff_frames, style_diff)
-from pbi_compare.config import CompareSettings, TenantProfile, load_profiles, owner_passcode
-from pbi_compare.dax_builder import UserFilter, fetch_values, filter_tables
-from pbi_compare.model import SemanticModel, diff_models, model_from_definition, model_from_info
-from pbi_compare.pbi_api import PbiApiError, PowerBIClient
-from pbi_compare.report_builder import build_excel, build_html, build_zip
-from pbi_compare.report_parser import FilterField, ReportDef, parse_pbix, parse_report_definition
-from pbi_compare.runner import FilterChoice, RunResult, Side, run_comparison
+from pbi_compare.config import CompareSettings, TenantProfile, load_profiles, owner_passcode  # noqa: E402
+from pbi_compare.dax_builder import UserFilter, fetch_values, filter_tables  # noqa: E402
+from pbi_compare.model import SemanticModel, diff_models, model_from_definition, model_from_info  # noqa: E402
+from pbi_compare.pbi_api import PowerBIClient  # noqa: E402
+from pbi_compare.report_builder import build_excel, build_html, build_zip  # noqa: E402
+from pbi_compare.report_parser import FilterField, ReportDef, parse_pbix, parse_report_definition  # noqa: E402
+from pbi_compare.rls import ADMIN, SideAccess, access_for, describe_identity, list_users
+from pbi_compare.runner import FilterChoice, RunResult, Side, run_comparison  # noqa: E402
 
 st.set_page_config(page_title="Power BI Prod vs Test Compare", page_icon="📊", layout="wide")
 
@@ -40,7 +64,8 @@ DEMO = "__demo__"
 SS = st.session_state
 for k, v in {"overrides": {}, "user_filters": [], "loaded": {}, "run": None,
              "table_map": {"prod": {}, "test": {}}, "owner_unlocked": False,
-             "value_cache": {}}.items():
+             "value_cache": {}, "rls": {"prod": {}, "test": {}},
+             "sql_defaults": {"prod": {}, "test": {}}}.items():
     SS.setdefault(k, v)
 
 
@@ -53,6 +78,35 @@ def _secrets() -> dict:
         return st.secrets.to_dict()
     except Exception:  # noqa: BLE001 - no secrets.toml locally
         return {}
+
+
+# ======================================================= sign-in helpers
+def _redirect_uri(p: TenantProfile) -> str:
+    """Where Microsoft sends users back to: the profile's redirect_uri, else the app's URL."""
+    if p.redirect_uri:
+        return p.redirect_uri
+    app_url = str((_secrets().get("admin", {}) or {}).get("app_url", "")).strip()
+    if app_url:
+        return app_url
+    try:
+        u = st.context.url  # Streamlit >= 1.46
+        return u.split("?")[0].rstrip("/") if u else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _user_provider(p: TenantProfile):
+    """Per-session sign-in: SSO (redirect) when possible, otherwise a device code."""
+    key = ("user_tp", p.tenant_id, p.client_id)
+    if key not in SS:
+        try:
+            redirect = _redirect_uri(p)
+            SS[key] = (SsoTokenProvider(p, redirect) if redirect and p.client_secret
+                       else UserTokenProvider(p))
+        except Exception as exc:  # noqa: BLE001 - e.g. network / bad tenant ID
+            st.error(f"Microsoft sign-in isn't available: {exc}")
+            return None
+    return SS[key]
 
 
 # ============================================== optional viewer passcode
@@ -77,10 +131,18 @@ with st.sidebar:
     profiles: Dict[str, TenantProfile] = load_profiles(_secrets())
     profiles.update(SS.overrides)
     options = list(profiles) + [DEMO]
+    # Returning from Microsoft sign-in: pick the tenant the sign-in started from
+    _qp = st.query_params.to_dict()
+    if SsoTokenProvider.is_callback(_qp):
+        _tk = SsoTokenProvider.pending_tenant(_qp.get("state", ""))
+        if _tk in profiles:
+            SS["tenant_sel"] = _tk
+            SS["run_as"] = "My Microsoft account"
     labels = {k: profiles[k].display_name for k in profiles}
     labels[DEMO] = "Demo (sample report, no tenant)"
     default = 0 if profiles else len(options) - 1
     tenant_key = st.selectbox("Tenant", options, index=default, format_func=lambda k: labels[k],
+                              key="tenant_sel",
                               help="Tenants come from the app's secrets. The app only talks to "
                                    "the tenant selected here.")
     demo = tenant_key == DEMO
@@ -137,19 +199,87 @@ with st.sidebar:
                  "slicer/filter selections, because only it can replace them."),
         max_rows=st.number_input("Max rows per visual", 1000, 100000, 50000, step=1000),
         generate_sql=st.toggle("Generate Snowflake validation SQL", True),
+        uppercase_identifiers=st.toggle(
+            "Snowflake: upper-case unquoted names", True,
+            help="Snowflake stores unquoted names in upper case, so PeriodDate is written "
+                 "PERIODDATE. Switch off if your Snowflake objects were created with quoted "
+                 "mixed-case names."),
     )
+
+    # ---------------------------------------------------------- run as
+    run_as_user = False
+    user_tp = None
+    if not demo and not profile.sign_in_enabled:
+        st.divider()
+        st.caption("Runs as the app's service principal. Row-level security is set aside: "
+                   "everyone sees all data (Admin).")
+    if not demo and profile.sign_in_enabled:
+        st.divider()
+        st.markdown("**Run as**")
+        run_opts = (["My Microsoft account", "App (service principal)"] if profile.sso
+                    else ["App (service principal)", "My Microsoft account"])
+        run_as = st.radio("Run as", run_opts, label_visibility="collapsed", key="run_as",
+                          help="**My Microsoft account** - you sign in (single sign-on) and see "
+                               "what Power BI shows you, including as a Viewer. The app's service "
+                               "principal still reads the report and model structure.\n\n"
+                               "**App** - everything runs as the service principal (models with "
+                               "row-level security then need a 'View data as' identity).")
+        run_as_user = run_as == "My Microsoft account"
+        if run_as_user:
+            user_tp = _user_provider(profile)
+            if user_tp is not None and user_tp.signed_in:
+                st.success(f"Signed in as {user_tp.username or 'you'}")
+                if st.button("Sign out"):
+                    user_tp.sign_out()
+                    for k in ("client", "client_key"):
+                        SS.pop(k, None)
+                    st.rerun()
+            elif isinstance(user_tp, UserTokenProvider):   # no redirect URI: device code
+                if user_tp.flow:
+                    st.info(f"Go to **{user_tp.flow['verification_uri']}** and enter code "
+                            f"**{user_tp.flow['user_code']}**, then click below.")
+                    if st.button("I've signed in", type="primary"):
+                        try:
+                            if user_tp.finish():
+                                for k in ("client", "client_key"):
+                                    SS.pop(k, None)
+                                st.rerun()
+                            else:
+                                st.warning("Not finished yet - complete the sign-in, then click again.")
+                        except AuthError as exc:
+                            st.error(str(exc))
+                elif st.button("Sign in with Microsoft (code)"):
+                    try:
+                        user_tp.start()
+                        st.rerun()
+                    except AuthError as exc:
+                        st.error(str(exc))
 
 
 # ======================================================= client helpers
 def get_client() -> Optional[PowerBIClient]:
     if demo:
         return None
-    key = (profile.tenant_id, profile.client_id)
+    key = (profile.tenant_id, profile.client_id, run_as_user)
     if SS.get("client_key") != key:
-        SS.client = PowerBIClient(TokenProvider(profile))
+        tokens = user_tp if run_as_user else TokenProvider(profile)
+        SS.client = PowerBIClient(tokens)
         SS.client_key = key
         SS.ws_cache, SS.rep_cache = None, {}
     return SS.client
+
+
+def meta_client() -> Optional[PowerBIClient]:
+    """Reads report + model structure. Always the app's service principal when it has a
+    secret, so signed-in Viewers (who can't read definitions) still get full analysis."""
+    if demo:
+        return None
+    if run_as_user and profile.client_secret:
+        k = ("meta_client", profile.tenant_id, profile.client_id)
+        if k not in SS:
+            SS[k] = PowerBIClient(TokenProvider(profile))
+        return SS[k]
+    return get_client()
 
 
 def workspaces() -> List[dict]:
@@ -217,24 +347,51 @@ def load_definitions(env: str, ws: dict, rep: dict, model_ws: dict) -> Dict:
                "refresh": side.last_refresh}
         SS.loaded[key] = out
         return out
-    c = get_client()
-    try:
-        rd = parse_report_definition(c.report_definition(ws["id"], rep["id"]))
-        src = f"Fabric getDefinition ({'PBIR' if rd.format == 'pbir' else 'legacy layout'})"
-    except Exception as exc:  # noqa: BLE001 - fall back to downloading the .pbix
-        rd = parse_pbix(c.export_pbix(ws["id"], rep["id"]))
-        src = f".pbix export (getDefinition unavailable: {str(exc)[:120]})"
+    clients = [c for c in dict.fromkeys([meta_client(), get_client()]) if c is not None]
     mws, ds = model_ws["id"], rep["datasetId"]
-    try:
-        model = model_from_definition(c.model_definition(mws, ds))
-    except Exception as exc:  # noqa: BLE001 - fall back to DAX INFO functions
-        model = model_from_info(lambda dax: c.execute_dax(mws, ds, dax))
-        model.warnings.insert(0, f"Model definition API unavailable ({str(exc)[:160]}); "
-                                 "metadata read with DAX INFO functions.")
+    rd = model = None
+    errors = []
+    for c in clients:
+        try:
+            rd = parse_report_definition(c.report_definition(ws["id"], rep["id"]))
+            src = f"Fabric getDefinition ({'PBIR' if rd.format == 'pbir' else 'legacy layout'})"
+            break
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc)[:150])
+        try:
+            rd = parse_pbix(c.export_pbix(ws["id"], rep["id"]))
+            src = ".pbix export"
+            break
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc)[:150])
+    if rd is None:
+        raise RuntimeError("Couldn't read the report layout: " + " | ".join(errors))
+    for c in clients:
+        try:
+            model = model_from_definition(c.model_definition(mws, ds))
+            break
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc)[:150])
+    if model is None:
+        model = model_from_info(lambda dax: clients[0].execute_dax(mws, ds, dax))
+        model.warnings.insert(0, "Model definition API unavailable; metadata read with DAX "
+                                 "INFO functions.")
+    c = get_client()
     out = {"report_def": rd, "model": model, "report_src": src,
            "refresh": c.last_refresh(mws, ds)}
     SS.loaded[key] = out
     return out
+
+
+def _typed(v: str):
+    """Typed-in filter value -> int / float / text."""
+    v = v.strip()
+    for cast in (int, float):
+        try:
+            return cast(v)
+        except ValueError:
+            pass
+    return v
 
 
 def loaded(env: str) -> Optional[Dict]:
@@ -255,9 +412,59 @@ elif not profile.is_complete():
                "Fill them in under **Owner settings** or in the app secrets.")
     st.stop()
 
+# ---------------------------------------------------------------- email first
+user_email = ""
+if not demo and profile.ask_email and not run_as_user:
+    user_email = SS.get(("user_email", tenant_key), "")
+    if not user_email:
+        st.title("Power BI report comparison")
+        st.markdown("Enter your work email to continue. Reports are shown with the data your "
+                    "email is allowed to see (row-level security).")
+        em = st.text_input("Work email", key="email_input", placeholder="name@company.com")
+        if st.button("Continue", type="primary"):
+            if profile.email_allowed(em):
+                SS[("user_email", tenant_key)] = em.strip().lower()
+                st.rerun()
+            elif "@" in em and profile.allowed_email_domains:
+                st.error("Use your company email (" + ", ".join(
+                    "@" + d.lstrip("@") for d in profile.allowed_email_domains) + ").")
+            else:
+                st.error("Enter a valid email address.")
+        st.stop()
+    with st.sidebar:
+        st.caption(f"Working as **{user_email}**")
+        if st.button("Change email"):
+            SS.pop(("user_email", tenant_key), None)
+            SS.pop("rls_role", None)
+            st.rerun()
+
+if run_as_user and isinstance(user_tp, SsoTokenProvider) and SsoTokenProvider.is_callback(_qp):
+    try:
+        user_tp.complete(_qp)
+        for k in ("client", "client_key"):
+            SS.pop(k, None)
+    except AuthError as exc:
+        st.error(f"Sign-in failed: {exc}")
+    st.query_params.clear()
+    st.rerun()
+
+if run_as_user and (user_tp is None or not user_tp.signed_in):
+    if isinstance(user_tp, SsoTokenProvider):
+        url = user_tp.login_url(tenant_key)
+        st.markdown(
+            f'<div style="margin:40px 0"><a href="{url}" target="_top" style="background:#2F2F2F;'
+            'color:#fff;padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:600">'
+            '&#x229E;&nbsp; Sign in with Microsoft</a></div>', unsafe_allow_html=True)
+        st.caption("You'll come straight back here after signing in. Your own Power BI "
+                   "permissions apply.")
+    else:
+        st.info("Sign in with your Microsoft account in the sidebar to continue, or switch "
+                "**Run as** to the app.")
+    st.stop()
+
 try:
     ws_list = workspaces()
-except (AuthError, PbiApiError) as exc:
+except Exception as exc:  # noqa: BLE001 - auth, API or network problems
     st.error(f"Could not list workspaces for this tenant: {exc}")
     st.stop()
 ws_by_id = {w["id"]: w for w in ws_list}
@@ -327,6 +534,116 @@ with tab_sel:
     ready_model = ready_sel and bool(loaded("prod") and loaded("test"))
     views: Dict[str, List[Optional[str]]] = {}
     choices: List[FilterChoice] = []
+
+    # ---- row-level security: "View data as" (OPRID list, or Admin = no RLS)
+    access: Dict[str, object] = {}
+    if ready_model and not demo:
+        rls_sides = [e for e in ("prod", "test") if loaded(e)["model"].has_rls]
+        if rls_sides and profile.rls_mode != "view_as" and not run_as_user:
+            # Pick one RLS role; both reports are shown exactly as that role sees them
+            st.divider()
+            st.subheader("Role")
+            all_roles = list(dict.fromkeys(r for e in rls_sides for r in loaded(e)["model"].roles))
+            low = {r.lower(): r for r in all_roles}
+            full = [r for e in rls_sides for r in loaded(e)["model"].full_access_roles()]
+            member_of = [r for e in rls_sides for r in loaded(e)["model"].roles_for(user_email)]
+            default_role = ((member_of[0] if member_of else None)
+                            or low.get(profile.default_role.lower()) or low.get("executive")
+                            or (full[0] if full else all_roles[0]))
+            c1, c2 = st.columns([2, 3])
+            role = c1.selectbox("Show data as role", all_roles,
+                                index=all_roles.index(default_role), key="rls_role",
+                                help="Row-level security role applied to both reports. The data, "
+                                     "screenshots and visuals show what this role sees.")
+            filters_txt = []
+            for e in rls_sides:
+                m_e: SemanticModel = loaded(e)["model"]
+                f = {t: d for t, d in (m_e.role_filters.get(role) or {}).items() if d}
+                if role in m_e.roles:
+                    filters_txt.append(("Production" if e == "prod" else "Test") + ": " + (
+                        "; ".join(f"{t}: {d.strip()[:120]}" for t, d in f.items()) or "no filters (all data)"))
+            c2.caption("Row filters - " + " · ".join(filters_txt) if filters_txt else "")
+            if member_of:
+                c1.caption(f"{user_email} is a member of: {', '.join(dict.fromkeys(member_of))}")
+            dynamic = any(role in loaded(e)["model"].dynamic_roles() for e in rls_sides)
+            uname = user_email
+            if dynamic and user_email:
+                c1.caption(f"'{role}' filters rows by the viewer - showing the data for "
+                           f"**{user_email}**.")
+            elif dynamic:
+                uname = c1.text_input("Username this role filters on (USERPRINCIPALNAME())",
+                                      key="rls_role_user", placeholder="name@company.com")
+                if not uname.strip():
+                    st.warning(f"Role '{role}' filters by the viewer's identity - enter a username, "
+                               "otherwise it returns no rows.")
+            for e in rls_sides:
+                m_e = loaded(e)["model"]
+                if role not in m_e.roles:
+                    st.warning(f"The {'Production' if e == 'prod' else 'Test'} model has no role "
+                               f"'{role}' (it has: {', '.join(m_e.roles)}). Comparing with "
+                               "different roles would give different numbers - add the role to "
+                               "that model or pick one both have.")
+                    continue
+                access[e] = SideAccess({"username": uname.strip() or "pbi-compare", "roles": [role]},
+                                       None, f"Role {role}")
+            st.caption("Power BI doesn't let the app's service principal run DAX on models with "
+                       "row-level security, so numbers are read from the visuals rendered as this "
+                       "role. Workspace admin rights don't change that for a service principal.")
+        elif rls_sides:
+            st.divider()
+            st.subheader("View data as")
+            utab, ucol = profile.rls_user_table, profile.rls_user_column
+            pm0: SemanticModel = loaded(rls_sides[0])["model"]
+            idcol, how = describe_identity(pm0, utab, ucol)
+            dkey = ("users", sel[rls_sides[0]]["rep"]["id"], utab, ucol, run_as_user)
+            if dkey not in SS:
+                sf = profile.snowflake
+                run_sql = None
+                if sf:
+                    from pbi_compare.snowflake_runner import run_sql as _rs
+                    run_sql = lambda q: _rs(sf, q)  # noqa: E731
+                from pbi_compare.sql_builder import SqlGenerator
+                sql_obj = SqlGenerator(pm0, SS.table_map[rls_sides[0]],
+                                       SS.sql_defaults[rls_sides[0]].get("database", ""),
+                                       SS.sql_defaults[rls_sides[0]].get("schema", ""),
+                                       settings.uppercase_identifiers).resolved_object(utab)[0]
+                SS[dkey] = list_users(pm0, utab, ucol, dax_runner(rls_sides[0]), run_sql, sql_obj)
+            directory = SS[dkey]
+            c1, c2 = st.columns([2, 3])
+            if directory.users:
+                choice = c1.selectbox(ucol, [ADMIN] + directory.users, key="view_as",
+                                      help=f"Users from {utab}[{ucol}]. Admin skips row-level security.")
+                c2.caption(f"{len(directory.users)} users from {utab} (read via {directory.source}). "
+                           + how)
+            else:
+                typed = c1.text_input(f"{ucol} (blank = Admin, no RLS)", key="view_as_typed",
+                                      placeholder="e.g. JSMITH")
+                choice = typed.strip() or ADMIN
+                c2.caption(f"Couldn't list {utab}[{ucol}] "
+                           + ("- the service principal can't query RLS models; sign in, or add "
+                              "Snowflake credentials to the secrets to list users from Snowflake"
+                              if "401" in directory.error else f"({directory.error[:160]})")
+                           + ". Type the user instead. " + how)
+            with st.expander("Advanced: roles and username per environment"):
+                for e in rls_sides:
+                    m_e: SemanticModel = loaded(e)["model"]
+                    st.markdown(f"**{'Production' if e == 'prod' else 'Test'}** - roles: "
+                                + ", ".join(f"{r} ({'no filter' if r in m_e.full_access_roles() else 'filtered'})"
+                                            for r in m_e.roles))
+                    uname = st.text_input("Override RLS username", SS.rls[e].get("username", ""),
+                                          key=f"rls_user_{e}")
+                    picked = st.multiselect("Override roles", m_e.roles,
+                                            default=SS.rls[e].get("roles") or [], key=f"rls_roles_{e}")
+                    SS.rls[e] = {"username": uname.strip(), "roles": picked}
+            for e in rls_sides:
+                acc = access_for(loaded(e)["model"], choice, directory, run_as_user, SS.rls[e])
+                access[e] = acc
+                if acc.note:
+                    st.caption(f"{'Production' if e == 'prod' else 'Test'}: {acc.note}")
+            if not run_as_user:
+                st.caption("The app's service principal can't run DAX on RLS models, so each "
+                           "visual's numbers are read from the report rendered as the identity "
+                           "above. Sign in (sidebar → Run as) for direct DAX queries.")
 
     if ready_model:
         prd: ReportDef = loaded("prod")["report_def"]
@@ -401,12 +718,24 @@ with tab_sel:
                                     vals = vals + extra
                                 SS.value_cache[vk] = vals
                             except Exception as exc:  # noqa: BLE001
-                                SS.value_cache[vk] = []
-                                c3.error(f"Couldn't read values: {str(exc)[:200]}")
-                        picked = c3.multiselect("Values", SS.value_cache[vk], key=f"vals_{k}",
-                                                format_func=lambda v: "(Blank)" if v is None else str(v),
-                                                label_visibility="collapsed",
-                                                placeholder=f"Choose {ff.field.label} values")
+                                SS.value_cache[vk] = None
+                                SS[("value_err", vk)] = str(exc)
+                        if SS.value_cache[vk] is None:
+                            err = SS.get(("value_err", vk), "")
+                            c3.caption("Couldn't list the values" + (
+                                " (row-level security blocks the service principal - sign in "
+                                "with your account to get a list)" if "401" in err else
+                                f" ({err[:150]})") + ". Type them instead:")
+                            typed = c3.text_input("Values", key=f"vals_txt_{k}",
+                                                  label_visibility="collapsed",
+                                                  placeholder=f"{ff.field.label} values, comma separated "
+                                                              "(e.g. 2024, 2025 or January, February)")
+                            picked = [_typed(v) for v in typed.split(",") if v.strip()]
+                        else:
+                            picked = c3.multiselect("Values", SS.value_cache[vk], key=f"vals_{k}",
+                                                    format_func=lambda v: "(Blank)" if v is None else str(v),
+                                                    label_visibility="collapsed",
+                                                    placeholder=f"Choose {ff.field.label} values")
                         if picked:
                             choices.append(FilterChoice(ff.field, list(picked)))
                 if ff_groups := {ff.group for ff in fields if ff.group}:
@@ -498,30 +827,54 @@ with tab_model:
             with mt[3]:
                 st.dataframe(fr["columns"], width="stretch", hide_index=True)
             with mt[4]:
-                st.markdown("Snowflake object behind each table, resolved from Power Query "
-                            "(including M parameters). Override any row - the SQL generator "
-                            "uses your value.")
+                st.markdown("Every table in the generated SQL is written as "
+                            "**DATABASE.SCHEMA.TABLE**. Parts come from Power Query; where it "
+                            "doesn't name them, the defaults below are used. Override any table "
+                            "in the grid with `DATABASE.SCHEMA.TABLE` (or `SCHEMA.TABLE`).")
+                from pbi_compare.sql_builder import SqlGenerator, is_auto_date
+                dbs = [t.source.database for t in model.tables.values() if t.source.database]
+                schs = [t.source.schema for t in model.tables.values() if t.source.schema]
+                d1, d2 = st.columns(2)
+                SS.sql_defaults[env]["database"] = d1.text_input(
+                    "Default Snowflake database", SS.sql_defaults[env].get("database", ""),
+                    key=f"sfdb_{env}", placeholder=(f"detected: {max(set(dbs), key=dbs.count)}"
+                                                    if dbs else "e.g. PROD_EDW"))
+                SS.sql_defaults[env]["schema"] = d2.text_input(
+                    "Default Snowflake schema", SS.sql_defaults[env].get("schema", ""),
+                    key=f"sfsch_{env}", placeholder=(f"detected: {max(set(schs), key=schs.count)}"
+                                                     if schs else "e.g. RPT"))
+                gen = SqlGenerator(model, SS.table_map[env], SS.sql_defaults[env].get("database", ""),
+                                   SS.sql_defaults[env].get("schema", ""),
+                                   settings.uppercase_identifiers)
                 rows = []
                 for n, t in model.tables.items():
-                    if n.startswith(("LocalDateTable_", "DateTableTemplate_")):
+                    if is_auto_date(n):
                         continue
-                    rows.append({"Table": n, "Detected source": t.source.fqn or
-                                 ("native SQL" if t.source.native_query else ""),
+                    obj, _n = gen.resolved_object(n)
+                    rows.append({"Table": n, "SQL uses": obj.replace("\n", " ")[:120],
+                                 "From Power Query": ".".join(x for x in (
+                                     t.source.database, t.source.schema, t.source.object_name) if x)
+                                 or ("native SQL" if t.source.native_query else
+                                     "calculated" if t.is_calculated else "not found"),
                                  "Connector": t.source.connector, "Server": t.source.server,
-                                 "Warehouse": t.source.warehouse,
                                  "Override (Snowflake object or (subquery))":
                                      SS.table_map[env].get(n, ""),
                                  "Notes": " ".join(t.source.notes)})
                 edited = st.data_editor(pd.DataFrame(rows), hide_index=True,
                                         width="stretch", key=f"map_{env}",
-                                        disabled=["Table", "Detected source", "Connector",
-                                                  "Server", "Warehouse", "Notes"])
+                                        disabled=["Table", "SQL uses", "From Power Query",
+                                                  "Connector", "Server", "Notes"])
                 SS.table_map[env] = {r["Table"]: r["Override (Snowflake object or (subquery))"]
                                      for _, r in edited.iterrows()
                                      if r["Override (Snowflake object or (subquery))"]}
                 if model.parameters:
-                    with st.expander("Power Query parameters"):
+                    with st.expander("Power Query parameters and shared queries"):
                         st.json(model.parameters)
+                with st.expander("Power Query (M) behind each table"):
+                    tsel = st.selectbox("Table", [n for n in model.tables if not is_auto_date(n)],
+                                        key=f"mq_{env}")
+                    st.code(model.tables[tsel].source.m_expression or
+                            model.tables[tsel].calc_expression or "(none)", language="powerquery")
             with mt[5]:
                 lay = []
                 for p in rd.pages:
@@ -612,13 +965,20 @@ with tab_run:
                               d["model"], [] if sel[env]["all"] else sel[env]["pages"],
                               dict(SS.table_map[env]), d["refresh"],
                               model_workspace=mws if mws["id"] != sel[env]["ws"]["id"] else None,
-                              dax_runner=base.dax_runner if base else None)
+                              dax_runner=base.dax_runner if base else None,
+                              identity=access[env].identity if env in access else None,
+                              impersonate=access[env].impersonate if env in access else None,
+                              sql_database=SS.sql_defaults[env].get("database", ""),
+                              sql_schema=SS.sql_defaults[env].get("schema", ""))
         bar = st.progress(0.0, "Starting…")
         try:
             SS.run = run_comparison(profile.display_name if profile else "Demo", sides["prod"],
                                     sides["test"], settings, SS.user_filters,
                                     lambda f, m: bar.progress(min(1.0, f), m),
                                     views=views, choices=choices)
+            SS.run.run_by = user_email
+            SS.run.role = SS.get("rls_role", "") if any(
+                s.identity for s in sides.values()) else ""
             for k in ("report_html", "report_key"):
                 SS.pop(k, None)
         except Exception as exc:  # noqa: BLE001

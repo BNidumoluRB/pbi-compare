@@ -7,6 +7,7 @@ current session only (nothing is written back to disk).
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Mapping, Optional
 
@@ -22,6 +23,33 @@ class TenantProfile:
     allowed_workspaces: tuple = ()
     # Optional Snowflake connection for executing the generated validation SQL.
     snowflake: Optional[dict] = field(default=None, repr=False)
+    # Row-level security: table + column listing the users you can "view data as"
+    rls_user_table: str = "RAM_PS_RB_BU_SBU_RUS"
+    rls_user_column: str = "OPRID"
+    # Microsoft single sign-on (auth-code flow). redirect_uri = the app's URL.
+    sso: bool = False
+    redirect_uri: str = ""
+    # Off by default: show "Run as → My Microsoft account" (needs app-registration changes)
+    allow_user_sign_in: bool = False
+    # "admin" (default): set RLS aside and show all data. "view_as": OPRID drop-down.
+    rls_mode: str = "admin"
+    # RLS role pre-selected in the role picker (e.g. "Executive")
+    default_role: str = "Executive"
+    # Ask each user for their work email first; it becomes their RLS identity
+    ask_email: bool = True
+    # Optional: only accept emails from these domains, e.g. ("rainbird.com",)
+    allowed_email_domains: tuple = ()
+
+    def email_allowed(self, email: str) -> bool:
+        email = (email or "").strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            return False
+        doms = [d.lower().lstrip("@") for d in self.allowed_email_domains]
+        return not doms or email.split("@", 1)[1] in doms
+
+    @property
+    def sign_in_enabled(self) -> bool:
+        return self.sso or self.allow_user_sign_in
 
     @property
     def authority(self) -> str:
@@ -62,6 +90,15 @@ def load_profiles(secrets: Mapping) -> Dict[str, TenantProfile]:
             client_secret=str(cfg.get("client_secret", "")).strip(),
             allowed_workspaces=tuple(cfg.get("allowed_workspaces", []) or []),
             snowflake=cfg.get("snowflake") or None,
+            rls_user_table=str(cfg.get("rls_user_table", "RAM_PS_RB_BU_SBU_RUS")).strip(),
+            rls_user_column=str(cfg.get("rls_user_column", "OPRID")).strip(),
+            sso=bool(cfg.get("sso", False)),
+            redirect_uri=str(cfg.get("redirect_uri", "")).strip(),
+            allow_user_sign_in=bool(cfg.get("allow_user_sign_in", False)),
+            rls_mode=str(cfg.get("rls_mode", "admin")).strip().lower(),
+            default_role=str(cfg.get("default_role", "Executive")).strip(),
+            ask_email=bool(cfg.get("ask_email", True)),
+            allowed_email_domains=tuple(cfg.get("allowed_email_domains", []) or []),
         )
     return profiles
 
@@ -84,3 +121,4 @@ class CompareSettings:
     generate_sql: bool = True         # build Snowflake validation SQL per visual
     include_sql_in_report: bool = True
     include_dax_in_report: bool = True
+    uppercase_identifiers: bool = True  # Snowflake: unquoted names are stored upper-case

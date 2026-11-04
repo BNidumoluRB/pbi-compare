@@ -78,6 +78,9 @@ def build_html(run: RunResult) -> str:
                   STATUS_SKIPPED, STATUS_HIDDEN) if s in c or s in (STATUS_MATCH, STATUS_DIFF))
     meta_rows = [
         ("Tenant", run.tenant),
+        ("Run by", run.run_by or "n/a"),
+        ("Row-level security", (f"role {run.role}" + (f" as {run.run_by}" if run.run_by else ""))
+         if run.role else "not applied"),
         ("Production", f"{run.prod.workspace.get('name')} / {run.prod.report.get('name')}"),
         ("Test", f"{run.test.workspace.get('name')} / {run.test.report.get('name')}"),
         ("Prod model last refresh", (run.prod.last_refresh or {}).get("endTime", "n/a")),

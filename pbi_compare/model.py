@@ -102,6 +102,45 @@ class SemanticModel:
     parameters: Dict[str, str] = field(default_factory=dict)  # shared M expressions
     origin: str = ""                                           # tmdl | bim | info
     warnings: List[str] = field(default_factory=list)
+    roles: List[str] = field(default_factory=list)             # RLS roles
+    role_filters: Dict[str, Dict[str, str]] = field(default_factory=dict)  # role -> table -> DAX
+    role_members: Dict[str, List[str]] = field(default_factory=dict)       # role -> emails/groups
+
+    def roles_for(self, email: str) -> List[str]:
+        """Roles the email is a direct member of (when the model records members)."""
+        e = (email or "").strip().lower()
+        return [r for r in self.roles if e and e in [m.lower() for m in self.role_members.get(r, [])]]
+
+    @property
+    def has_rls(self) -> bool:
+        return bool(self.roles)
+
+    def full_access_roles(self) -> List[str]:
+        """Roles with no row filters - applying one of them shows all data."""
+        return [r for r in self.roles if not any((self.role_filters.get(r) or {}).values())]
+
+    def dynamic_roles(self) -> List[str]:
+        """Roles whose filters depend on who is viewing (USERPRINCIPALNAME() etc.)."""
+        return [r for r in self.roles if any(_IDENT_FUNC.search(f or "")
+                                             for f in (self.role_filters.get(r) or {}).values())]
+
+    def identity_column(self) -> Optional[Tuple[str, str, str]]:
+        """(table, column, function) that dynamic RLS compares with the user's identity,
+        e.g. ('RAM_PS_RB_BU_SBU_RUS', 'EMAIL', 'USERPRINCIPALNAME')."""
+        for r in self.roles:
+            for tbl, f in (self.role_filters.get(r) or {}).items():
+                hit = rls_identity_ref(f or "", tbl)
+                if hit:
+                    return hit
+        return None
+
+    def date_source(self, table: str) -> Optional[Tuple[str, str]]:
+        """Auto date/time tables (LocalDateTable_*) -> the real date column they hang off."""
+        for r in self.relationships:
+            if r.to_table == table and not r.from_table.startswith(("LocalDateTable_",
+                                                                     "DateTableTemplate_")):
+                return r.from_table, r.from_column
+        return None
 
     # ---------------------------------------------------------- lookups
     def table(self, name: str) -> Optional[Table]:
@@ -242,6 +281,33 @@ class SemanticModel:
         return "\n".join(lines)
 
 
+# ======================================================== RLS helpers
+_IDENT_FUNC = re.compile(r"\b(USERPRINCIPALNAME|USERNAME|CUSTOMDATA|USEROBJECTID)\s*\(\s*\)", re.I)
+_REF = r"(?:'((?:[^']|'')+)'|([A-Za-z_]\w*))?\[([^\]]+)\]"
+
+
+def rls_identity_ref(filter_dax: str, home_table: str) -> Optional[Tuple[str, str, str]]:
+    """Find the column a role filter compares with the viewer's identity.
+
+    Handles  T[Col] = USERPRINCIPALNAME(),  USERNAME() = [Col],  T[Col] IN {USERNAME()}
+    and LOOKUPVALUE(..., T[Col], USERPRINCIPALNAME()).
+    """
+    pats = [_REF + r"\s*(?:=|==|IN\s*\{)\s*" + r"(USERPRINCIPALNAME|USERNAME|CUSTOMDATA|USEROBJECTID)\s*\(\s*\)",
+            r"(USERPRINCIPALNAME|USERNAME|CUSTOMDATA|USEROBJECTID)\s*\(\s*\)\s*(?:=|==)\s*" + _REF,
+            _REF + r"\s*,\s*(USERPRINCIPALNAME|USERNAME|CUSTOMDATA|USEROBJECTID)\s*\(\s*\)"]
+    for i, pat in enumerate(pats):
+        m = re.search(pat, filter_dax or "", re.I)
+        if not m:
+            continue
+        if i == 1:
+            func, q, b, col = m.group(1), m.group(2), m.group(3), m.group(4)
+        else:
+            q, b, col, func = m.group(1), m.group(2), m.group(3), m.group(4)
+        tbl = (q.replace("''", "'") if q else b) or home_table
+        return tbl, col, func.upper()
+    return None
+
+
 # ======================================================== DAX ref helpers
 _COLREF = re.compile(r"(?:'((?:[^']|'')+)'|([A-Za-z_][\w]*))?\[([^\]]+)\]")
 _TABLE_FUNCS = re.compile(r"\b(?:COUNTROWS|ALL|ALLSELECTED|VALUES|FILTER|RELATEDTABLE)\s*\(\s*"
@@ -282,7 +348,7 @@ def translatable(expr: str) -> bool:
 # ============================================================ TMDL parser
 _OBJ_KW = {"model", "table", "column", "measure", "partition", "relationship", "hierarchy",
            "level", "calculationGroup", "calculationItem", "expression", "annotation",
-           "extendedProperty", "role", "perspective", "culture", "database", "dataSource",
+           "extendedProperty", "role", "member", "perspective", "culture", "database", "dataSource",
            "ref", "tablePermission", "queryGroup", "variation", "linguisticMetadata",
            "calendar", "formatStringDefinition", "detailRowsDefinition"}
 
@@ -427,6 +493,11 @@ def model_from_tmdl(parts: Dict[str, str]) -> SemanticModel:
             model.name = n.name
         if n.kind == "expression":
             model.parameters[n.name] = n.expr
+        if n.kind == "role":
+            model.roles.append(n.name)
+            model.role_filters[n.name] = {c.name: c.expr for c in n.children
+                                          if c.kind == "tablePermission"}
+            model.role_members[n.name] = [c.name for c in n.children if c.kind == "member"]
         if n.kind == "table":
             t = Table(n.name, is_hidden="isHidden" in n.props)
             for ch in n.children:
@@ -487,6 +558,12 @@ def model_from_bim(text: str) -> SemanticModel:
                 t.is_calculated, t.calc_expression = True, _j(src.get("expression"))
             t.source = SourceInfo(mode=p.get("mode", "import"), m_expression=_j(src.get("expression")))
         model.tables[t.name] = t
+    model.roles = [r["name"] for r in m.get("roles", []) if r.get("name")]
+    model.role_filters = {r["name"]: {tp.get("name"): _j(tp.get("filterExpression"))
+                                      for tp in r.get("tablePermissions", []) or []}
+                          for r in m.get("roles", []) if r.get("name")}
+    model.role_members = {r["name"]: [mb.get("memberName", "") for mb in r.get("members", []) or []]
+                          for r in m.get("roles", []) if r.get("name")}
     for r in m.get("relationships", []):
         model.relationships.append(Relationship(
             r["fromTable"], r["fromColumn"], r["toTable"], r["toColumn"], r.get("isActive", True),
@@ -551,6 +628,16 @@ def model_from_info(run_dax: Callable[[str], List[dict]]) -> SemanticModel:
                 model.tables[tname].source = SourceInfo(m_expression=_g(r, "QueryDefinition"))
         for r in run_dax("EVALUATE INFO.EXPRESSIONS()"):
             model.parameters[_g(r, "Name")] = _g(r, "Expression")
+        try:
+            role_ids = {_g(r, "ID"): _g(r, "Name") for r in run_dax("EVALUATE INFO.ROLES()")}
+            model.roles = list(role_ids.values())
+            model.role_filters = {n: {} for n in model.roles}
+            for r in run_dax("EVALUATE INFO.TABLEPERMISSIONS()"):
+                rn, tn = role_ids.get(_g(r, "RoleID")), tables.get(_g(r, "TableID"))
+                if rn and tn:
+                    model.role_filters[rn][tn] = _g(r, "FilterExpression")
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001 - fall back to the INFO.VIEW family
         model = _model_from_info_view(run_dax)
         model.warnings.append(f"INFO.* needs admin on the model ({exc}); used INFO.VIEW.* "
@@ -596,41 +683,84 @@ def _m_str_or_param(token: str, params: Dict[str, str]) -> str:
     return token
 
 
-def parse_m_source(m_expr: str, params: Dict[str, str]) -> SourceInfo:
+_ARG = r'("(?:[^"]|"")*"|#"(?:[^"]|"")*"|[A-Za-z_][\w.]*)'
+
+
+def _rec_value(rec: str, key: str, params: Dict[str, str]) -> str:
+    m = re.search(r"\b" + key + r"\s*=\s*" + _ARG, rec)
+    return _m_str_or_param(m.group(1), params) if m else ""
+
+
+def _simple_from(sql: str) -> Optional[str]:
+    """'SELECT * FROM db.schema.tbl' (optionally WHERE ...) -> 'db.schema.tbl'."""
+    m = re.match(r"\s*select\s+\*\s+from\s+([\w.\"\[\]$]+)\s*(?:;|\s*$)", sql, re.I)
+    return m.group(1) if m else None
+
+
+def parse_m_source(m_expr: str, params: Dict[str, str],
+                   shared: Optional[Dict[str, str]] = None) -> SourceInfo:
+    """Work out the database object a Power Query (M) partition reads.
+
+    Handles Snowflake.Databases, Sql.Database (incl. [Query="..."]), ODBC,
+    Value.NativeQuery, navigation records in any key order, and partitions that
+    start from a shared query (expressions.tmdl) - those are inlined first.
+    """
     si = SourceInfo(m_expression=m_expr)
     if not m_expr:
         return si
-    arg = r'("(?:[^"]|"")*"|#"(?:[^"]|"")*"|[A-Za-z_][\w.]*)'
-    sf = re.search(r"Snowflake\.Databases\s*\(\s*" + arg + r"\s*,\s*" + arg, m_expr)
+    text = _inline_shared(m_expr, shared or {})
+    arg = _ARG
+    sf = re.search(r"Snowflake\.Databases\s*\(\s*" + arg + r"\s*,\s*" + arg, text)
+    sq = re.search(r"\b(Sql\.Databases?|AzureDataExplorer\.Contents|AmazonRedshift\.Database|"
+                   r"GoogleBigQuery\.Database|Databricks\.Catalogs|Odbc\.DataSource|Odbc\.Query|"
+                   r"Oracle\.Database|PostgreSQL\.Database)\s*\(\s*" + arg + r"(?:\s*,\s*" + arg + r")?",
+                   text)
     if sf:
         si.connector = "Snowflake"
         si.server = _m_str_or_param(sf.group(1), params)
         si.warehouse = _m_str_or_param(sf.group(2), params)
-    else:
-        other = re.search(r"\b([A-Z][A-Za-z]+\.(?:Database|Databases|Contents))\s*\(", m_expr)
-        if other:
-            si.connector = other.group(1)
-            si.notes.append(f"Non-Snowflake connector {other.group(1)}; SQL may need dialect edits.")
-    for kind in ("Database", "Schema", "Table", "View"):
-        mm = re.search(r"\[\s*Name\s*=\s*" + arg + r"\s*,\s*Kind\s*=\s*\"" + kind + r"\"\s*\]",
-                       m_expr)
-        if mm:
-            val = _m_str_or_param(mm.group(1), params)
-            if kind == "Database":
-                si.database = val
-            elif kind == "Schema":
-                si.schema = val
-            else:
-                si.object_name = val
-    if not si.object_name:
-        # Sql.Database style navigation:  Source{[Schema="dbo",Item="Sales"]}[Data]
-        mm = re.search(r"\[\s*Schema\s*=\s*" + arg + r"\s*,\s*Item\s*=\s*" + arg + r"\s*\]", m_expr)
-        if mm:
-            si.schema, si.object_name = (_m_str_or_param(mm.group(1), params),
-                                         _m_str_or_param(mm.group(2), params))
-    nq = re.search(r"Value\.NativeQuery\s*\([^,]+,\s*" + _STR, m_expr, re.S)
-    if nq:
-        si.native_query = nq.group(1).replace('""', '"').replace("#(lf)", "\n")
+    elif sq:
+        si.connector = sq.group(1)
+        si.server = _m_str_or_param(sq.group(2), params)
+        if sq.group(1) == "Sql.Database" and sq.group(3):
+            si.database = _m_str_or_param(sq.group(3), params)
+        if sq.group(1) == "Odbc.Query" and sq.group(3):
+            si.native_query = _m_str_or_param(sq.group(3), params)
+        si.notes.append(f"Model reads through {sq.group(1)} (not the Snowflake connector); "
+                        "the SQL targets the same database/schema/table names in Snowflake.")
+    # navigation records: {[Name="X", Kind="Database"]}, {[Schema="dbo", Item="T"]}, in any order
+    for rec in re.findall(r"\{\s*\[([^\[\]]*)\]\s*\}", text):
+        kind = _rec_value(rec, "Kind", params)
+        name = _rec_value(rec, "Name", params)
+        if kind and name:
+            k = kind.lower()
+            if k == "database" and not si.database:
+                si.database = name
+            elif k == "schema":
+                si.schema = name
+            elif k in ("table", "view", "function"):
+                si.object_name = name
+            continue
+        sch, item = _rec_value(rec, "Schema", params), _rec_value(rec, "Item", params)
+        if item:
+            si.schema, si.object_name = sch or si.schema, item
+    # native SQL: Value.NativeQuery(src, "sql") or Sql.Database(..., [Query="sql"])
+    nq = re.search(r"Value\.NativeQuery\s*\([^,]+,\s*" + _STR, text, re.S) or \
+        re.search(r"\bQuery\s*=\s*" + _STR, text, re.S)
+    if nq and not si.native_query:
+        si.native_query = nq.group(1)
+    if si.native_query:
+        si.native_query = si.native_query.replace('""', '"').replace("#(lf)", "\n") \
+            .replace("#(cr)", "").replace("#(tab)", "\t")
+        simple = _simple_from(si.native_query)
+        if simple:  # SELECT * FROM a.b.c -> just use the object
+            parts = [p.strip('"[]') for p in simple.split(".")]
+            si.object_name = parts[-1]
+            if len(parts) >= 2:
+                si.schema = parts[-2]
+            if len(parts) >= 3:
+                si.database = parts[-3]
+            si.native_query = ""
     for rn in re.finditer(r"Table\.RenameColumns\s*\([^{]*\{(.*?)\}\s*\)", m_expr, re.S):
         for old, new in re.findall(r'\{\s*"((?:[^"]|"")*)"\s*,\s*"((?:[^"]|"")*)"\s*\}', rn.group(1)):
             si.renames[new] = old
@@ -643,13 +773,29 @@ def parse_m_source(m_expr: str, params: Dict[str, str]) -> SourceInfo:
     return si
 
 
+def _inline_shared(m_expr: str, shared: Dict[str, str], depth: int = 0) -> str:
+    """Append the text of shared queries the partition refers to (recursively)."""
+    if depth > 4 or not shared:
+        return m_expr
+    out = m_expr
+    for name, body in shared.items():
+        if re.match(r'\s*("(?:[^"]|"")*"|\d+(\.\d+)?|true|false)\s*(meta\b|$)', body or ""):
+            continue  # plain parameter - handled by _m_str_or_param
+        pat = r'#"' + re.escape(name) + r'"' if not re.match(r"^[A-Za-z_]\w*$", name) else \
+            r'(?<![\w"])' + re.escape(name) + r'(?![\w"])'
+        if re.search(pat, m_expr):
+            out += "\n" + _inline_shared(body, {k: v for k, v in shared.items() if k != name},
+                                         depth + 1)
+    return out
+
+
 def _resolve_sources(model: SemanticModel) -> None:
     for t in model.tables.values():
         if t.is_calculated:
             continue
         mode = t.source.mode
         if t.source.m_expression:
-            t.source = parse_m_source(t.source.m_expression, model.parameters)
+            t.source = parse_m_source(t.source.m_expression, model.parameters, model.parameters)
             t.source.mode = mode
 
 
