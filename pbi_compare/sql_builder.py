@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from .model import SemanticModel, _sf_ident
+from .model import SemanticModel
 from .report_parser import Field, FilterSpec, Visual, parse_field
 
 
@@ -314,28 +314,82 @@ class SqlResult:
     notes: List[str]
 
 
+AUTO_DATE = ("LocalDateTable_", "DateTableTemplate_")
+
+
+def is_auto_date(table: str) -> bool:
+    return table.startswith(AUTO_DATE)
+
+
 class SqlGenerator:
-    def __init__(self, model: SemanticModel, table_overrides: Optional[Dict[str, str]] = None):
+    """Builds Snowflake SQL. Every table is written as DATABASE.SCHEMA.TABLE:
+    parts the model doesn't reveal come from ``default_database`` / ``default_schema``
+    (set per environment in the app), and ``table_overrides`` win over everything."""
+
+    def __init__(self, model: SemanticModel, table_overrides: Optional[Dict[str, str]] = None,
+                 default_database: str = "", default_schema: str = "",
+                 uppercase_identifiers: bool = True):
         self.model = model
         self.overrides = {k: v for k, v in (table_overrides or {}).items() if v}
+        self.default_db = (default_database or "").strip()
+        self.default_schema = (default_schema or "").strip()
+        self.upper = uppercase_identifiers
 
     # ------------------------------------------------------------ helpers
-    def _from_sql(self, table: str) -> Tuple[str, List[str]]:
+    def ident(self, name: str) -> str:
+        """Snowflake identifier: simple names unquoted and upper-case (how Snowflake stores
+        unquoted names); anything else quoted exactly."""
+        name = name.strip()
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_$]*$", name):
+            return name.upper() if self.upper else (name if name.isupper() else f'"{name}"')
+        return '"' + name.replace('"', '""') + '"'
+
+    def qualify(self, database: str, schema: str, obj: str) -> Tuple[str, List[str]]:
+        notes = []
+        db = database or self.default_db
+        sch = schema or self.default_schema
+        if not db:
+            notes.append(f"No database known for {obj} - set the default database for this "
+                         "environment (Model insights → Snowflake mapping).")
+        if not sch:
+            notes.append(f"No schema known for {obj} - set the default schema for this "
+                         "environment (Model insights → Snowflake mapping).")
+        parts = [db or "<DATABASE>", sch or "<SCHEMA>", obj]
+        return ".".join(p if p.startswith("<") else self.ident(p) for p in parts), notes
+
+    def resolved_object(self, table: str) -> Tuple[str, List[str]]:
+        """The fully qualified Snowflake object (or subquery) behind a model table."""
         if table in self.overrides:
-            return self.overrides[table], []
+            ov = self.overrides[table].strip()
+            if ov.startswith("("):
+                return ov, []
+            parts = [p.strip() for p in ov.split(".")]
+            if len(parts) == 3:
+                return ".".join(self.ident(p) for p in parts), []
+            return self.qualify(parts[0] if len(parts) == 2 else "",
+                                parts[-2] if len(parts) == 2 else "", parts[-1])
         t = self.model.table(table)
         if not t:
-            return _sf_ident(table), [f"Table {table} not in model."]
+            return self.qualify("", "", table.upper().replace(" ", "_"))[0], \
+                [f"Table {table} not in model."]
         notes = list(t.source.notes)
         if t.is_calculated:
             notes.append(f"{table} is a DAX calculated table - map it to a Snowflake object "
-                         "in 'Table mapping'.")
-        src = t.source.sql_from()
-        if not src:
-            notes.append(f"No Snowflake source found for {table}; using its name. Set it in "
-                         "'Table mapping'.")
-            src = _sf_ident(table.upper().replace(" ", "_"))
-        return src, notes
+                         "in 'Snowflake mapping'.")
+        if t.source.native_query:
+            notes.append(f"{table} is loaded with a native SQL query - it is used as a subquery; "
+                         "check it runs in Snowflake.")
+            return f"(\n{t.source.native_query.strip()}\n)", notes
+        obj = t.source.object_name
+        if not obj:
+            notes.append(f"No source object found for {table} in Power Query; using the table "
+                         "name. Set it in 'Snowflake mapping'.")
+            obj = re.sub(r"\W+", "_", table).upper()
+        fq, n2 = self.qualify(t.source.database, t.source.schema, obj)
+        return fq, notes + n2
+
+    def _from_sql(self, table: str) -> Tuple[str, List[str]]:
+        return self.resolved_object(table)
 
     def _join_path(self, base: str, needed: Set[str]) -> Tuple[List[Tuple[str, str, str, str, str]], List[str]]:
         """BFS from base across active relationships. Returns join steps."""
@@ -393,10 +447,17 @@ class SqlGenerator:
                     for t, _c in cols:
                         mtables[t] = mtables.get(t, 0) + 1
         roles = self.model.table_roles()
+        for t in [t for t in mtables if is_auto_date(t)]:
+            src = self.model.date_source(t)
+            mtables.pop(t)
+            if src:
+                mtables[src[0]] = mtables.get(src[0], 0) + 1
+        mtables.pop("", None)
         if mtables:
             base = sorted(mtables, key=lambda t: (roles.get(t) != "fact", -mtables[t]))[0]
         elif groups:
-            base = groups[0].table
+            base = next((self.model.date_source(g.table)[0] if is_auto_date(g.table) and
+                         self.model.date_source(g.table) else g.table for g in groups), "")
         else:
             base = visual.fields[0].table if visual.fields else ""
 
@@ -431,7 +492,7 @@ class SqlGenerator:
             select.append(f"{expr} AS {_q(f.label)}")
 
         # every table referenced above must be joined to the base table
-        needed = {t for t in self.alias if t} | set(mtables)
+        needed = {t for t in self.alias if t and not is_auto_date(t)} | set(mtables)
         steps, jnotes = self._join_path(base, needed) if base else ([], [])
         notes += jnotes
         for st in steps:
@@ -474,9 +535,18 @@ class SqlGenerator:
 
     # --------------------------------------------------------- resolvers
     def _src_col(self, table: str, column: str) -> str:
-        return _sf_ident(self.model.source_column_name(table, column) or column)
+        return self.ident(self.model.source_column_name(table, column) or column)
 
     def col_sql(self, table: str, column: str, variation_level: str = "") -> str:
+        if is_auto_date(table):
+            # Auto date/time table: compute the level from the real date column instead
+            src = self.model.date_source(table)
+            if not src:
+                raise NotTranslatable(f"auto date table {table} has no source date column")
+            lvl = {"date": "", "year": "year", "monthno": "monthno", "month": "month",
+                   "quarterno": "quarterno", "quarter": "quarter", "day": "day"
+                   }.get(column.lower(), "")
+            return self.col_sql(src[0], src[1], lvl)
         alias = self.alias.get(table)
         if alias is None:
             alias = self.alias.setdefault(table, f"t{len(self.alias)}")
@@ -494,8 +564,12 @@ class SqlGenerator:
             return f"YEAR({base})"
         if lvl == "quarter":
             return f"'Qtr ' || QUARTER({base})"
+        if lvl == "quarterno":
+            return f"QUARTER({base})"
         if lvl == "month":
             return f"TO_CHAR({base}, 'MMMM')"
+        if lvl == "monthno":
+            return f"MONTH({base})"
         if lvl == "day":
             return f"DAY({base})"
         return base
