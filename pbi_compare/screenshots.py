@@ -40,6 +40,8 @@ class PageShot:
     error: str = ""
     bookmark: str = ""
     hidden: set = field(default_factory=set)   # visuals not visible in this view
+    data: Dict[str, str] = field(default_factory=dict)       # visual -> exported CSV
+    data_errors: Dict[str, str] = field(default_factory=dict)
 
 
 # A view = one page, optionally with a bookmark applied (tabs built with buttons).
@@ -151,13 +153,15 @@ def _wrap(text: str, n: int) -> List[str]:
 
 # ============================================================ Export API
 def shoot_with_export_api(client: PowerBIClient, ws: str, report_id: str, views: Sequence[View],
-                          export_filters: Sequence[str], progress=None) -> Dict[str, PageShot]:
+                          export_filters: Sequence[str], progress=None,
+                          identity: Optional[dict] = None, dataset: str = ""
+                          ) -> Dict[str, PageShot]:
     shots: Dict[str, PageShot] = {}
     for pg, bm in views:
         shot = PageShot(pg.name, engine="export_api", bookmark=bm or "")
         try:
             shot.png = client.export_png(ws, report_id, pg.name, None, list(export_filters),
-                                         bookmark=bm)
+                                         bookmark=bm, identity=identity, dataset=dataset)
             shot.visuals = crop_visuals(shot.png, pg)
         except Exception as exc:  # noqa: BLE001
             shot.error = str(exc)
@@ -276,8 +280,23 @@ async def _wait_render(tab, n: int, timeout: int = 90_000) -> None:
         pass
 
 
+_EXPORT_DATA_JS = """async (names) => {
+  const p = await window.__report.getActivePage();
+  const vs = await p.getVisuals();
+  const out = {};
+  for (const v of vs) {
+    if (!names.includes(v.name)) continue;
+    try { const r = await v.exportData(window.__models.ExportDataType.Summarized, 100000);
+          out[v.name] = {ok: true, data: r.data}; }
+    catch (e) { out[v.name] = {ok: false, error: JSON.stringify(e && (e.detail || e.message || e))}; }
+  }
+  return out;
+}"""
+
+
 async def _shoot_browser_async(embed_url: str, report_id: str, token: str, token_type: int,
-                               views: Sequence[View], choices_js: dict, settle_ms: int
+                               views: Sequence[View], choices_js: dict, settle_ms: int,
+                               export_data: Optional[Dict[str, List[str]]] = None
                                ) -> Dict[str, PageShot]:
     from playwright.async_api import async_playwright
 
@@ -352,6 +371,14 @@ async def _shoot_browser_async(embed_url: str, report_id: str, token: str, token
                     shot.visuals = crop_visuals(shot.png, pg, shot.layouts)
                     for hn in shot.hidden:
                         shot.visuals.pop(hn, None)
+                    want = (export_data or {}).get(view_key(pg.name, bm))
+                    if want:  # read the numbers straight from the rendered visuals
+                        res = await tab.evaluate(_EXPORT_DATA_JS, list(want))
+                        for vn, r in (res or {}).items():
+                            if r.get("ok"):
+                                shot.data[vn] = r.get("data", "")
+                            else:
+                                shot.data_errors[vn] = r.get("error", "")
                 except Exception as exc:  # noqa: BLE001
                     shot.error = str(exc)
                 shots[view_key(pg.name, bm)] = shot
@@ -361,19 +388,29 @@ async def _shoot_browser_async(embed_url: str, report_id: str, token: str, token
 
 
 def shoot_with_browser(client: PowerBIClient, ws: str, report: dict, views: Sequence[View],
-                       choices_js: dict, settle_ms: int = 2500,
-                       progress=None) -> Dict[str, PageShot]:
-    try:
-        token, ttype = client.generate_embed_token(ws, report["id"], report["datasetId"]), 1
-    except Exception:  # noqa: BLE001 - fall back to the service principal's AAD token
+                       choices_js: dict, settle_ms: int = 2500, progress=None,
+                       identity: Optional[dict] = None,
+                       export_data: Optional[Dict[str, List[str]]] = None) -> Dict[str, PageShot]:
+    if client.is_user and not identity:
+        # signed-in person: embed with their own Azure AD token ("embed for your organisation")
         token, ttype = client.tokens(), 0
+    else:
+        # service principal, or a person viewing as another user: embed token with RLS identity
+        try:
+            token, ttype = client.generate_embed_token(ws, report["id"], report["datasetId"],
+                                                       identity), 1
+        except Exception:  # noqa: BLE001
+            if not client.is_user:
+                raise
+            token, ttype = client.tokens(), 0   # screenshots then show the signed-in view
     result: Dict[str, PageShot] = {}
     error: List[BaseException] = []
 
     def run():
         try:
             result.update(asyncio.run(_shoot_browser_async(
-                report["embedUrl"], report["id"], token, ttype, views, choices_js, settle_ms)))
+                report["embedUrl"], report["id"], token, ttype, views, choices_js, settle_ms,
+                export_data)))
         except BaseException as exc:  # noqa: BLE001
             error.append(exc)
 

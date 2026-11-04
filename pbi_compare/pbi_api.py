@@ -39,7 +39,8 @@ class PowerBIClient:
                 kw["headers"] = {}
                 continue
             if resp.status_code >= 400:
-                raise PbiApiError(_explain(resp), resp.status_code, resp.text[:2000])
+                raise PbiApiError(_explain(resp, url, self.is_user), resp.status_code,
+                                  resp.text[:2000])
             if raw:
                 return resp
             if not resp.content:
@@ -104,8 +105,13 @@ class PowerBIClient:
             return None  # DirectQuery / live models have no refresh history
 
     # ---------------------------------------------------------------- query
-    def execute_dax(self, ws: str, dataset: str, dax: str) -> List[dict]:
-        body = {"queries": [{"query": dax}], "serializerSettings": {"includeNulls": True}}
+    def execute_dax(self, ws: str, dataset: str, dax: str,
+                    impersonated_user: Optional[str] = None) -> List[dict]:
+        body: Dict[str, Any] = {"queries": [{"query": dax}],
+                                "serializerSettings": {"includeNulls": True}}
+        if impersonated_user and self.is_user:
+            # apply RLS as that user (only allowed for signed-in people, not service principals)
+            body["impersonatedUserName"] = impersonated_user
         res = self._post(f"/groups/{ws}/datasets/{dataset}/executeQueries", json=body)
         result = res.get("results", [{}])[0]
         if "error" in result:
@@ -162,18 +168,40 @@ class PowerBIClient:
         return resp.content
 
     # ------------------------------------------------------- screenshots
-    def generate_embed_token(self, ws: str, report: str, dataset: str) -> str:
-        body = {"reports": [{"id": report}], "datasets": [{"id": dataset}],
-                "targetWorkspaces": []}
+    @property
+    def is_user(self) -> bool:
+        """True when signed in as a person (delegated token) rather than the app."""
+        return bool(getattr(self.tokens, "is_user", False))
+
+    def generate_embed_token(self, ws: str, report: str, dataset: str,
+                             identity: Optional[dict] = None) -> str:
+        """Embed token for the headless browser.
+
+        Models with row-level security need an effective identity (username +
+        roles) in the token; models without RLS must not get one.
+        """
+        body: Dict[str, Any] = {"reports": [{"id": report}], "datasets": [{"id": dataset}],
+                                "targetWorkspaces": []}
+        if identity:
+            body["identities"] = [_identity(identity, dataset)]
+        errors = []
         try:
             return self._post("/GenerateToken", json=body)["token"]
-        except PbiApiError:
-            return self._post(f"/groups/{ws}/reports/{report}/GenerateToken",
-                              json={"accessLevel": "View"})["token"]
+        except PbiApiError as exc:
+            errors.append(f"GenerateToken: {exc}")
+        legacy: Dict[str, Any] = {"accessLevel": "View"}
+        if identity:
+            legacy["identities"] = [_identity(identity, dataset)]
+        try:
+            return self._post(f"/groups/{ws}/reports/{report}/GenerateToken", json=legacy)["token"]
+        except PbiApiError as exc:
+            errors.append(f"report GenerateToken: {exc}")
+        raise PbiApiError("Couldn't create an embed token. " + " | ".join(errors))
 
     def export_png(self, ws: str, report: str, page: str, visual: Optional[str] = None,
                    report_filters: Optional[List[str]] = None, timeout_s: int = 600,
-                   bookmark: Optional[str] = None) -> bytes:
+                   bookmark: Optional[str] = None, identity: Optional[dict] = None,
+                   dataset: str = "") -> bytes:
         """Export-To-File API (needs Premium / Fabric / PPU capacity)."""
         page_cfg: Dict[str, Any] = {"pageName": page}
         if visual:
@@ -183,6 +211,8 @@ class PowerBIClient:
         cfg: Dict[str, Any] = {"pages": [page_cfg]}
         if report_filters:
             cfg["reportLevelFilters"] = [{"filter": f} for f in report_filters]
+        if identity:
+            cfg["identities"] = [_identity(identity, dataset)]
         job = self._post(f"/groups/{ws}/reports/{report}/ExportTo",
                          json={"format": "PNG", "powerBIReportConfiguration": cfg})
         export_id = job["id"]
@@ -198,12 +228,34 @@ class PowerBIClient:
         raise PbiApiError("Export timed out")
 
 
-def _explain(resp: requests.Response) -> str:
-    hints = {
-        401: "Unauthorized - check the client secret and that the tenant setting "
-             "'Service principals can use Fabric APIs' includes this app.",
-        403: "Forbidden - add the service principal to the workspace (Member/Contributor), "
-             "and for DAX queries enable 'Dataset Execute Queries REST API'.",
-        404: "Not found - wrong ID or the service principal can't see this item.",
-    }
-    return f"HTTP {resp.status_code}. {hints.get(resp.status_code, '')} {resp.text[:400]}"
+def _identity(identity: dict, dataset: str) -> dict:
+    return {"username": identity.get("username") or "pbi-compare",
+            "roles": list(identity.get("roles") or []), "datasets": [dataset]}
+
+
+def _explain(resp: requests.Response, url: str = "", is_user: bool = False) -> str:
+    body = resp.text[:400]
+    who = "your account" if is_user else "the service principal"
+    if resp.status_code == 401 and "executeQueries" in url:
+        hint = ("Power BI refused the DAX query. If this semantic model has row-level security "
+                "(RLS), service principals can't query it - sign in with your Microsoft account "
+                "(sidebar → Run as), or the app reads the numbers from the rendered visuals "
+                "instead. Otherwise, ask the Power BI admin to enable 'Dataset Execute Queries "
+                "REST API' for this app.")
+    elif resp.status_code == 400 and "effective identity" in body:
+        hint = ("This model has row-level security, so an RLS identity is required. Set it under "
+                "'Row-level security' for this environment, or sign in with your Microsoft account.")
+    elif resp.status_code == 404 and "FeatureNotAvailable" in body:
+        hint = ("The Export API isn't available for this report (capacity or tenant setting "
+                "'Export reports as image files'). The headless browser is used instead.")
+    elif resp.status_code == 401:
+        hint = (f"Unauthorized - {who} isn't allowed. Check the client secret / sign-in and that "
+                "the tenant setting 'Service principals can use Fabric APIs' includes this app.")
+    elif resp.status_code == 403:
+        hint = (f"Forbidden - give {who} access to the workspace (Member/Contributor), including "
+                "the semantic model's workspace if it is separate.")
+    elif resp.status_code == 404:
+        hint = f"Not found - wrong ID, or {who} can't see this item."
+    else:
+        hint = ""
+    return f"HTTP {resp.status_code}. {hint} {body}"

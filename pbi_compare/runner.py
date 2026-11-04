@@ -52,6 +52,17 @@ class Side:
     model_workspace: Optional[dict] = None   # where the semantic model lives, if elsewhere
     # Demo/offline mode: callable(dax) -> rows, instead of the REST API
     dax_runner: Optional[Callable[[str], List[dict]]] = None
+    # Row-level security identity {"username", "roles"} for embed tokens / exports
+    identity: Optional[dict] = None
+    # Signed-in user only: run DAX with RLS applied as this user (impersonatedUserName)
+    impersonate: Optional[str] = None
+    # Snowflake: database / schema used where Power Query doesn't name them
+    sql_database: str = ""
+    sql_schema: str = ""
+
+    def sql_generator(self, uppercase: bool = True) -> SqlGenerator:
+        return SqlGenerator(self.model, self.table_overrides, self.sql_database, self.sql_schema,
+                            uppercase)
 
     @property
     def ws_id(self) -> str:
@@ -68,7 +79,7 @@ class Side:
     def run_dax(self, dax: str) -> List[dict]:
         if self.dax_runner:
             return self.dax_runner(dax)
-        return self.client.execute_dax(self.model_ws_id, self.dataset_id, dax)
+        return self.client.execute_dax(self.model_ws_id, self.dataset_id, dax, self.impersonate)
 
 
 @dataclass
@@ -162,6 +173,8 @@ class RunResult:
     pages: List[PageResult] = field(default_factory=list)
     model_diff: Optional[pd.DataFrame] = None
     log: List[str] = field(default_factory=list)
+    run_by: str = ""                  # email the user entered
+    role: str = ""                    # RLS role the comparison used
 
     def all_visuals(self) -> List[VisualResult]:
         return [v for p in self.pages for v in p.visuals]
@@ -278,7 +291,7 @@ def run_comparison(tenant: str, prod: Side, test: Side, settings: CompareSetting
             sv.error = str(exc)[:1500]
         if settings.generate_sql:
             try:
-                sv.sql = SqlGenerator(side.model, side.table_overrides).generate(
+                sv.sql = side.sql_generator(settings.uppercase_identifiers).generate(
                     sv.visual, filters, f"{side.label} - {side.report.get('name', '')}")
             except Exception as exc:  # noqa: BLE001
                 vr.notes.append(f"{side.label} SQL generation failed: {exc}")
@@ -289,10 +302,6 @@ def run_comparison(tenant: str, prod: Side, test: Side, settings: CompareSetting
         for _ in pool.map(run_job, jobs):
             done[0] += 1
             progress(0.05 + 0.6 * done[0] / total, f"Queried {done[0]} of {total} visual datasets")
-
-    for pr in res.pages:
-        for vr in pr.visuals:
-            _finalise(vr, settings)
 
     # ------------------------------------------------------ screenshots
     if settings.screenshot_mode != "off":
@@ -306,8 +315,21 @@ def run_comparison(tenant: str, prod: Side, test: Side, settings: CompareSetting
             views_side = list({view_key(p.name, b): (p, b) for p, b in views_side}.values())
             if not views_side:
                 continue
-            progress(0.7 + 0.12 * k, f"Capturing {side.label} screenshots ({len(views_side)} views)")
-            shots = _capture(side, views_side, user_filters, list(choices), settings, res.log)
+            # visuals whose DAX query was refused (e.g. RLS model + service principal):
+            # read their numbers from the rendered report instead
+            need: Dict[str, List[str]] = {}
+            for pr in res.pages:
+                pg = pr.prod_page if side is prod else pr.test_page
+                bm = pr.prod_bookmark if side is prod else pr.test_bookmark
+                for vr in pr.visuals:
+                    sv = vr.prod if side is prod else vr.test
+                    if pg is not None and sv.visual is not None and sv.error and sv.dax:
+                        need.setdefault(view_key(pg.name, bm.name if bm else None), []).append(
+                            sv.visual.name)
+            progress(0.7 + 0.12 * k, f"Capturing {side.label} screenshots ({len(views_side)} views)"
+                     + (" and reading visual data" if need else ""))
+            shots = _capture(side, views_side, user_filters, list(choices), settings, res.log,
+                             need)
             for pr in res.pages:
                 pg = pr.prod_page if side is prod else pr.test_page
                 bm = pr.prod_bookmark if side is prod else pr.test_bookmark
@@ -323,12 +345,31 @@ def run_comparison(tenant: str, prod: Side, test: Side, settings: CompareSetting
                     pr.notes.append(f"{side.label} screenshot: {shot.error}")
                 for vr in pr.visuals:
                     sv = vr.prod if side is prod else vr.test
+                    if sv.visual is not None and sv.error and sv.dax:
+                        if sv.visual.name in shot.data:
+                            try:
+                                sv.frame = export_csv_to_frame(shot.data[sv.visual.name], sv.visual,
+                                                               sv.dax)
+                                vr.notes.append(f"{side.label}: DAX query refused ({sv.error[:120]}…) "
+                                                "- numbers read from the rendered visual instead.")
+                                sv.error = ""
+                            except Exception as exc:  # noqa: BLE001
+                                sv.error += f" | reading the rendered visual failed: {exc}"
+                        elif sv.visual.name in shot.data_errors:
+                            sv.error += (" | reading the rendered visual failed: "
+                                         + shot.data_errors[sv.visual.name][:300])
+                for vr in pr.visuals:
+                    sv = vr.prod if side is prod else vr.test
                     if sv.visual is None or vr.status == STATUS_HIDDEN or sv.visual.is_group:
                         continue
                     sv.screenshot = shot.visuals.get(sv.visual.name) or placeholder_png(
                         f"{side.label}: no screenshot for '{sv.visual.label()}'. "
                         f"{shot.error or 'Visual is hidden in this view or outside the canvas.'}",
                         480, 200)
+
+    for pr in res.pages:
+        for vr in pr.visuals:
+            _finalise(vr, settings)
 
     for pr in res.pages:
         for side, pg, shot in ((prod, pr.prod_page, pr.prod_shot), (test, pr.test_page, pr.test_shot)):
@@ -402,9 +443,44 @@ def _choices_js(side: Side, views, choices: Sequence[FilterChoice],
     return {"ov": ov, "meta": meta, "extra": [u.to_js_filter() for u in user_filters]}
 
 
+def export_csv_to_frame(csv_text: str, visual: Visual, q: DaxQuery) -> pd.DataFrame:
+    """CSV from visual.exportData -> frame with the same column labels as the DAX result."""
+    import io as _io
+    df = pd.read_csv(_io.StringIO(csv_text.lstrip("\ufeff")))
+    labels = [lab for _, lab in q.columns]
+    by_name = {lab.lower().strip(): lab for lab in labels}
+    rename, used = {}, set()
+    for c in df.columns:
+        lab = by_name.get(str(c).lower().strip())
+        if lab and lab not in used:
+            rename[c] = lab
+            used.add(lab)
+    if len(rename) < len(labels):
+        # fall back to the visual's own field order (how exportData orders columns)
+        order = []
+        for f in visual.fields:
+            if f.kind == "unsupported":
+                continue
+            lab = next((lab for _, lab in q.columns if lab == f.label or lab.rstrip() == f.label),
+                       f.label)
+            if lab not in order:
+                order.append(lab)
+        if len(order) == len(df.columns):
+            rename = dict(zip(df.columns, order))
+    df = df.rename(columns=rename)
+    for lab in q.value_labels:
+        if lab in df.columns:
+            num = pd.to_numeric(df[lab].astype(str).str.replace(r"[,$%\s]", "", regex=True),
+                                errors="coerce")
+            if num.notna().sum() >= df[lab].notna().sum():
+                df[lab] = num
+    return df
+
+
 def _capture(side: Side, views, user_filters: Sequence[UserFilter],
              choices: Sequence[FilterChoice], settings: CompareSettings,
-             log: List[str]) -> Dict[str, PageShot]:
+             log: List[str], need_data: Optional[Dict[str, List[str]]] = None
+             ) -> Dict[str, PageShot]:
     if side.client is None:  # demo mode: draw a wireframe of each view instead
         out = {}
         for p, bm in views:
@@ -417,27 +493,34 @@ def _capture(side: Side, views, user_filters: Sequence[UserFilter],
         return out
     mode = settings.screenshot_mode
     if mode == "auto":
-        # Export API can add filters but can't clear or replace slicer selections,
-        # so filter choices need the browser engine to be faithful.
+        # Export API can add filters but can't clear or replace slicer selections, and
+        # can't hand back visual data - both need the browser engine.
         mode = "export_api" if side.workspace.get("isOnDedicatedCapacity") and not choices \
-            else "browser"
-    log.append(f"{side.label}: screenshots via {mode}")
+            and not need_data else "browser"
+    if need_data and mode == "export_api":
+        mode = "browser"
+        log.append(f"{side.label}: using the browser so visual data can be read")
+    who = ("your account" + (f" viewing as {side.identity.get('username')}" if side.identity else "")
+           ) if side.client.is_user else (
+        f"RLS identity {side.identity.get('username')} / roles {', '.join(side.identity.get('roles') or [])}"
+        if side.identity else "the service principal")
+    log.append(f"{side.label}: screenshots via {mode} as {who}")
     cjs = _choices_js(side, views, choices, user_filters)
     try:
         if mode == "export_api":
-            if choices:
-                log.append(f"{side.label}: Export API can't replace slicer selections - "
-                           "screenshots show saved slicer state; data uses your choices.")
             shots = shoot_with_export_api(side.client, side.ws_id, side.report["id"], views,
-                                          [u.to_export_filter() for u in user_filters])
+                                          [u.to_export_filter() for u in user_filters],
+                                          identity=side.identity, dataset=side.dataset_id)
             failed = [(p, b) for p, b in views if not shots[view_key(p.name, b)].png]
             if failed:
                 k0 = view_key(failed[0][0].name, failed[0][1])
                 log.append(f"{side.label}: Export API failed for {len(failed)} view(s) "
-                           f"({shots[k0].error[:200]}); retrying in browser")
-                shots.update(shoot_with_browser(side.client, side.ws_id, side.report, failed, cjs))
+                           f"({shots[k0].error[:300]}); retrying in browser")
+                shots.update(shoot_with_browser(side.client, side.ws_id, side.report, failed, cjs,
+                                                identity=side.identity))
             return shots
-        return shoot_with_browser(side.client, side.ws_id, side.report, views, cjs)
+        return shoot_with_browser(side.client, side.ws_id, side.report, views, cjs,
+                                  identity=side.identity, export_data=need_data)
     except Exception as exc:  # noqa: BLE001
         log.append(f"{side.label}: screenshots failed - {exc}")
         return {view_key(p.name, b): PageShot(p.name, error=str(exc)[:300]) for p, b in views}

@@ -122,6 +122,78 @@ functions.)
 workspace for every DAX query, the model definition and refresh history. It's shown under
 *Semantic model location* for each side and can be changed there.
 
+### Email first
+
+Each user starts by entering their **work email** (switch off with `ask_email = false`). The email:
+
+* is the identity row-level security filters on - a role such as *Restricted* that uses
+  `USERPRINCIPALNAME()` shows exactly that person's rows;
+* pre-selects the role when the model records role members (the user's own role is chosen);
+* is shown in the sidebar and recorded in the report ("Run by").
+
+The email is **not verified** - nobody signs in, so anyone could type someone else's address. Limit
+who can use the app with `allowed_email_domains = ["yourcompany.com"]` and the `viewer_passcode`;
+real verification needs the parked SSO.
+
+### Row-level security: pick a role
+
+When a model has row-level security, a **Role** picker appears right after you choose the reports.
+It lists the model's roles (e.g. *Executive*, *Restricted*) and defaults to `default_role` from the
+secrets (*Executive* if not set). Both reports are then rendered and compared exactly as that role
+sees them, and the role is recorded in the report. The row filters of the chosen role are shown
+next to the picker; a role that filters on `USERPRINCIPALNAME()` also asks for a username. If one
+environment lacks the chosen role the app warns, because different roles give different numbers.
+
+Why a role is needed at all, and why workspace admin rights don't help: Power BI requires an RLS
+role whenever a **service principal** renders a report on an RLS model, and never lets a service
+principal run DAX on one - even if it's a workspace Admin. (RLS only skips *people* who are
+workspace Admins/Members/Contributors, which needs the parked sign-in.) So numbers are read from the
+rendered visuals: keep the tenant setting *Export to .csv* on and each report's *Export data* option
+at "Summarized data" or higher. The generated SQL is unaffected.
+
+The options below are **parked** - switch them on per tenant in the secrets when your app
+registration allows it (`sso`, `allow_user_sign_in`, `rls_mode = "view_as"`).
+
+### Sign-in (SSO) and row-level security (parked)
+
+**Microsoft single sign-on.** With `sso = true` on a tenant, everyone signs in with their own
+Microsoft account before using the app (one click if they're already signed in to Microsoft 365).
+Data, screenshots and value lists then use **their** Power BI permissions, so users who are only
+**Viewers** work too. The report and model *structure* is still read by the app's service
+principal, because Viewers can't read definitions. One-time setup on the app registration:
+
+1. *Authentication* → *Add a platform* → **Web** → Redirect URI = your Streamlit app URL
+   (e.g. `https://rb-compare.streamlit.app`). Put the same URL in `redirect_uri` in the secrets.
+2. *API permissions* → *Add* → **Power BI Service** → *Delegated*: `Dataset.Read.All`,
+   `Report.Read.All`, `Workspace.Read.All` → **Grant admin consent**.
+3. For Viewers: give them **Build** permission on the semantic models so DAX queries work. Without
+   Build the app still works - it reads each visual's numbers from the rendered report instead.
+
+Microsoft's sign-in page can't open inside the github.io frame, so the sign-in button opens it in
+the full window and users land on the app's own URL afterwards. Without a redirect URI the app falls
+back to a device-code sign-in.
+
+**"View data as" (row-level security).** When a model has RLS, a drop-down lists every user from
+`RAM_PS_RB_BU_SBU_RUS[OPRID]` (configurable per tenant with `rls_user_table` / `rls_user_column`)
+plus **Admin (no RLS)**:
+
+| Choice | Signed in (SSO) | App (service principal) |
+|---|---|---|
+| Admin | Your own access - Members/Contributors aren't restricted by RLS (Viewers are) | The model's unrestricted role (a role with no row filters, e.g. *Admin*) |
+| A user | DAX runs as that user (`impersonatedUserName`); screenshots use an RLS embed identity | Screenshots and numbers come from the report rendered as that user |
+
+The app reads the role filters to find what RLS compares with the user's identity. If the filter
+is `[EMAILID] = USERPRINCIPALNAME()`, each OPRID is translated to its EMAILID automatically. The
+user list is read with DAX; when the service principal is refused, it is read from Snowflake if
+`[tenants.<key>.snowflake]` is configured (`SELECT DISTINCT OPRID … FROM DB.SCHEMA.RAM_PS_RB_BU_SBU_RUS`);
+otherwise the OPRID can be typed. *Advanced* lets you override roles and username per environment.
+
+If the model has no role without filters, *Admin* can't skip RLS for the service principal - sign
+in with a Member account, or add an unrestricted *Admin* role to the model.
+
+**App mode with RLS** needs the tenant setting *Export to .csv* on and each report's *Export data*
+option at "Summarized data" or higher, because numbers are read from the rendered visuals.
+
 ### 4. Deploy on Streamlit Community Cloud
 1. Push this folder to a GitHub repository.
 2. [share.streamlit.io](https://share.streamlit.io) → *Create app* → pick the repo, branch, `app.py`,
@@ -197,7 +269,13 @@ pages. The *Bookmarks / tabs* tab under Model insights lists every button and wh
    COUNTA / COUNTROWS / DISTINCTCOUNT`, the `…X` iterators, `DIVIDE`, `IF`, `SWITCH(TRUE())`,
    `VAR/RETURN`, nested measures and `CALCULATE` with column filters. Anything else is emitted as
    `NULL /* TODO … original DAX … */` and the visual is flagged *needs review* - the SQL is never
-   silently wrong. Override any table's Snowflake object on the *Snowflake mapping* tab.
+   silently wrong. Every table is written as **DATABASE.SCHEMA.TABLE**: the parts come from
+   Power Query (Snowflake connector, `Sql.Database`, ODBC, `[Query="select * from …"]`, shared
+   queries and parameters); set a **default database and schema per environment** on *Model insights
+   → Snowflake mapping* for anything Power Query doesn't name, or override any table there.
+   Auto date/time tables (`LocalDateTable_…`) are never joined - Year/Month come straight from the
+   real date column (`YEAR(t.PERIODDATE)`). Simple names are written upper-case and unquoted, the
+   way Snowflake stores them (switch off in the sidebar if your objects use quoted mixed case).
 7. **Report.** HTML (self-contained, screenshots embedded), Excel (summary, model diff, one
    highlighted sheet per visual, all SQL) and a ZIP with the HTML, Excel, every PNG, `.sql` and `.dax`.
    SQL generation can be switched off in the sidebar, and SQL / DAX can be left out of the report
